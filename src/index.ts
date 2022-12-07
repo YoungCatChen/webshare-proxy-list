@@ -1,46 +1,46 @@
-export interface Env {
-  // Example binding to KV. Learn more at
-  // https://developers.cloudflare.com/workers/runtime-apis/kv/ MY_KV_NAMESPACE:
-  // KVNamespace;
-  //
-  // Example binding to Durable Object. Learn more at
-  // https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-  // MY_DURABLE_OBJECT: DurableObjectNamespace;
-  //
-  // Example binding to R2. Learn more at
-  // https://developers.cloudflare.com/workers/runtime-apis/r2/ MY_BUCKET:
-  // R2Bucket;
-}
-
-
 /**
- * Proxy format from source.
+ * Proxy format from the source, i.e. webshare.io.
  * @see https://proxy.webshare.io/docs/api/#list-proxies
  */
 interface WebshareProxy {
-  id: string, username: string, password: string, proxy_address: string,
-      port: number, valid: boolean, last_verification: string,
-      country_code: string, city_name: string, created_at: string,
+  id: string;                 // 'd-10513'
+  username: string;           // 'user'
+  password: string;           // 'pass'
+  proxy_address: string;      // '1.2.3.4'
+  port: number;               // 8168
+  valid: boolean;             // true
+  last_verification: string;  // '2019-06-09T23:34:00.095501-07:00'
+  country_code: string;       // 'US'
+  city_name: string;          // 'New York'
+  created_at: string;         // '2022-06-14T11:58:10.246406-07:00'
 }
 
 
 /**
+ * Fetches the proxy list from webshare.io and converts it to the ShadowRocket
+ * format.
+ *
  * To manually get the proxy list from source:
  *
  *   `curl -H 'Authorization: Token 123abc'
  *   'https://proxy.webshare.io/api/v2/proxy/list/?mode=direct'`
  *
- * @returns Destination format:
+ * @param request The http request. The `url` param will be used as the url of
+ *    the data source to be fetched. Any param starting with `p-` will be
+ *    treated as passthrough headers; as an example, `?p-Authorization=abc123`
+ *    will result in an http request header `Authorization: abc123`.
+ *
+ * @returns Destination format: a Base64 encoded string of:
  *    ```
  *    REMARKS=Name
- *    socks://user:pass@1.2.3.4:1234?remarks=name1&obfs=none&tfo=1
- *    socks://user:pass@1.2.3.4:1234?remarks=name2&obfs=none&tfo=1
- *    socks://user:pass@1.2.3.4:1234?remarks=name3&obfs=none&tfo=1
+ *    socks://BASE64?remarks=name1&obfs=none&tfo=1
+ *    socks://BASE64?remarks=name2&obfs=none&tfo=1
+ *    socks://BASE64?remarks=name3&obfs=none&tfo=1
  *    ```
  *
  * @see Source format: https://proxy.webshare.io/docs/api/#list-proxies
  */
-async function handler(request: Request): Promise<Response> {
+async function convertList(request: Request): Promise<Response> {
   const url = new URL(request.url);
   const sourceUrl = url.searchParams.get('url');
   if (!sourceUrl) {
@@ -61,38 +61,56 @@ async function handler(request: Request): Promise<Response> {
   const sourceText = await resp.text();
   const sourceJson = JSON.parse(sourceText);
   const sourceProxies: WebshareProxy[] = sourceJson['results'];
-  sourceProxies.sort((a, b) => a.proxy_address.localeCompare(b.proxy_address));
 
-  const destProxies = sourceProxies.map(convert);
-  const destText = 'REMARKS=Webshare Proxies\n' + destProxies.join('\n');
+  const destProxies = sourceProxies.filter(p => p.valid).map(convertProxy);
+  destProxies.sort((a, b) => a.sortName.localeCompare(b.sortName));
+  const destText =
+      'REMARKS=Webshare Proxies\n' + destProxies.map(p => p.line).join('\n');
+  const destB64 = Buffer.from(destText).toString('base64');
 
-  return new Response(destText);
+  return new Response(destB64);
 };
 
 
 /**
+ * Converts a single proxy in Webshare format into the ShadowRocket format.
  *
  * @param webshareProxy See `WebshareProxy`.
- * @returns `socks://user:pass@1.2.3.4:1234?remarks=name1&obfs=none&tfo=1`
+ * @returns Format `socks://BASE64?remarks=name1&obfs=none&tfo=1`, where BASE64
+ *     represents a base64 encoded string of format `user:pass@1.2.3.4:1234`.
  */
-function convert(webshareProxy: WebshareProxy): string {
+function convertProxy(webshareProxy: WebshareProxy):
+    {line: string, sortName: string} {
   const p = webshareProxy;
-  if (!p['valid']) return '';
-  return `socks://${p.username}:${p.password}@${p.proxy_address}:` +
-      `${p.port}?remarks=${p.proxy_address}&obfs=none&tfo=1`;
+  const sortName = `${p.country_code} ${p.city_name}: ${p.proxy_address}`;
+  const displayName = `${p.city_name}: ${p.proxy_address}`;
+  const encodedName = encodeURIComponent(displayName);
+  const addr = `${p.username}:${p.password}@${p.proxy_address}:${p.port}`;
+  const addrB64 = Buffer.from(addr).toString('base64');
+  return {
+    sortName: sortName,
+    line: `socks://${addrB64}?remarks=${encodedName}&obfs=none&tfo=1`,
+  };
 }
 
 
-async function wrappedHandler(
+/**
+ * Dispatches the request to a handler.
+ *
+ * Entry point of the program. Usage:
+ * `http://foo.bar/convert?p-Authorization=Token%20ABC123&url=https://proxy.webshare.io/api/v2/proxy/list/?mode=direct`
+ */
+async function dispatch(
     request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  const url = new URL(request.url);
-  if (!url.pathname.endsWith('/convert')) {
-    return new Response(
-        `Not found. The pathname was ${url.pathname}`, {status: 404});
-  }
   try {
-    const resp = await handler(request);
-    return resp;
+    const url = new URL(request.url);
+    if (url.pathname.endsWith('/convert')) {
+      const resp = await convertList(request);
+      return resp;
+    }
+    return new Response(
+        `Not found. Cannot dispatch the request with pathname ${url.pathname}`,
+        {status: 404});
   } catch (ex) {
     if (ex instanceof Error) {
       return new Response(ex.stack, {status: 403});
@@ -103,4 +121,6 @@ async function wrappedHandler(
   }
 }
 
-export default {fetch: wrappedHandler};
+
+export interface Env {}
+export default {fetch: dispatch};
